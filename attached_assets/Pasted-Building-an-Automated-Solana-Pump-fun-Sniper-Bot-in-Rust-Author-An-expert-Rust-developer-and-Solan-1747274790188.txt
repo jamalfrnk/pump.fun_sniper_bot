@@ -1,0 +1,612 @@
+Building an Automated Solana Pump.fun Sniper Bot in Rust
+
+Author: An expert Rust developer and Solana blockchain architect
+
+This guide provides a comprehensive, step-by-step walkthrough to build a Solana sniper bot that automatically targets newly launched tokens on Pump.fun. We will cover everything from architecture and module breakdowns to working Rust code examples, testing strategies, and deployment with Docker. By the end, you will have a robust bot capable of: generating or importing a wallet, monitoring Pump.fun for new tokens, filtering out scams, executing swaps via Jupiter Aggregator, enforcing slippage controls, monitoring prices, automating sells at profit targets, logging trades, providing a CLI/TUI dashboard, and running continuously with resiliency and security best practices.
+
+Architecture Overview
+
+Pump.fun is a Solana platform allowing anyone to create and trade “fair-launch” tokens. When a new token is created on Pump.fun, a bonding curve program (Pump.fun’s on-chain program) initializes a token mint and sets an initial price curve ￼ ￼. Our sniper bot will integrate directly with this on-chain program to detect new token launches in real-time. The high-level architecture is broken into the following components:
+	•	Wallet Management: Create or import a Solana keypair (public/private key) to act as the trading wallet. The bot uses this wallet to sign transactions (buys/sells) and manage token accounts securely.
+	•	Pump.fun Monitor: Subscribe to on-chain events or use an API to detect newly launched Pump.fun tokens. We will use Solana’s websocket program subscription to listen for Pump.fun’s program instructions indicating a new token creation ￼. Alternatively, third-party APIs or scraping Pump.fun’s site could be used, but direct on-chain subscription offers speed and reliability.
+	•	Scam/Rug Filter: Apply heuristics to skip tokens likely to be scams or rug-pulls. We can filter by the token’s creator address, the token’s early trading patterns, whether the bonding curve is progressing normally, etc. (Details in a later section).
+	•	Auto-Buy Execution: Upon detecting a legitimate new token, the bot will automatically purchase a fixed amount (e.g. 0.1 SOL worth) of the token. We integrate with Jupiter Aggregator – Solana’s leading DEX aggregator – to swap SOL for the new token at the best price ￼. The Jupiter API handles routing the swap through Pump.fun’s liquidity (or PumpSwap) seamlessly.
+	•	Slippage Control: The bot enforces a slippage tolerance (e.g. 0.5%) on swap transactions. This ensures we don’t drastically overpay if price moves between the quote and execution ￼.
+	•	Price Monitoring: After purchase, the bot continuously monitors the token’s price (using Jupiter’s live price API) to detect when it reaches profit targets.
+	•	Auto-Sell Logic: The bot automatically takes profits in two stages:
+	•	Sell 50% of holdings when price reaches 4× the buy price.
+	•	Sell the remaining 50% when price reaches 8× the buy price.
+	•	Logging & Analytics: All transactions and events (buys, sells, profits, errors) are logged to local files for analysis. The bot also tracks the wallet’s SOL and token balances over time to compute profits.
+	•	CLI/TUI Interface: A basic command-line interface or text-based UI displays real-time status: active token positions, current prices vs. targets, balance changes, etc. This helps visualize performance as the bot runs.
+	•	Continuous Operation & Resilience: The bot is designed to run 24/7. It will automatically reconnect and retry on RPC errors, handle transaction failures by re-fetching quotes or new blockhashes, and avoid crashing on exceptions.
+	•	Security & Safety: We implement best practices such as secure key storage, rate limiting API calls, careful error handling, and optional Discord alerts for important events. Deployment is done via Docker for an isolated, reproducible environment on an Ubuntu server.
+
+System Diagram: The following diagram illustrates the bot’s workflow from detecting a new token to executing trades and monitoring outcomes:
+
+￼ ￼(Diagram: A flowchart showing: Pump.fun On-Chain Program -> Bot’s Websocket Listener -> New Token Detected -> Filter Check -> Jupiter Swap (Buy) -> Price Monitor Loop -> Jupiter Swap (Sell 50% @4x) -> Jupiter Swap (Sell rest @8x) -> Logging/Alerts -> Repeat)
+
+Project Setup and Wallet Management
+
+Before diving into Pump.fun specifics, we’ll set up our Rust project and ensure we have a Solana wallet to use:
+	•	Rust Toolchain: Ensure you have the latest stable Rust installed (e.g. via rustup). We will use modern Rust edition and async features.
+	•	Dependencies: In your Cargo.toml, include the Solana SDK crates and any others we need:
+
+[dependencies]
+solana-sdk = "1.16"          # Solana SDK for keypairs, pubkeys, system instructions
+solana-client = "1.16"       # Solana RPC client for sending transactions
+solana-account-config = "1.16"
+spl-token = "3.5"            # SPL token program utilities (if needed for parsing)
+spl-associated-token-account = "1.1"  # For creating associated token accounts
+jup-ag = "0.8"              # Jupiter aggregator API bindings for Rust [oai_citation:7‡github.com](https://github.com/mvines/rust-jup-ag#:~:text=jup)
+tokio = { version = "1", features = ["full"] }  # Async runtime for subscriptions
+anyhow = "1"                # Error handling
+dotenv = "0.15"             # (Optional) to load env variables like private keys
+log = "0.4"                 # Logging library
+
+Note: The jup-ag crate provides convenient bindings to Jupiter’s API (quote, swap, price) ￼. We’ll use it to simplify swap logic. Ensure the versions match the latest Solana cluster (1.16 or above for 2025).
+
+	•	Wallet Keypair: The bot needs a Solana wallet. You can import an existing keypair (e.g. from a file or environment variable) or generate a new one. For security, avoid hard-coding secrets – use environment variables or a secure file. Below is a module wallet.rs handling keypair loading or generation:
+
+use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signer::keypair::read_keypair_file;
+use std::path::Path;
+
+pub fn get_trading_keypair() -> Keypair {
+    // First, attempt to read from a file path in env (to import existing wallet)
+    if let Ok(path) = std::env::var("WALLET_PATH") {
+        if Path::new(&path).exists() {
+            return read_keypair_file(path).expect("Failed to read keypair file");
+        }
+    }
+    // Otherwise, generate a new keypair and save it for future use
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
+    println!("Generated new wallet: {}", pubkey);
+    // Save to disk with proper permissions
+    let outfile = "sniper-wallet.json";
+    std::fs::write(outfile, keypair.to_bytes()).expect("Unable to write keypair");
+    println!("Saved new keypair to {}", outfile);
+    keypair
+}
+
+This function will check if an environment variable WALLET_PATH is set (pointing to a JSON or keyfile) and load it. If not provided, it generates a new random keypair. In production, you’d likely provide your own wallet (funded with some SOL) rather than generating a fresh one each run. Secure the key – if using a file, restrict permissions and consider encryption. Never expose the private key in logs or code.
+
+	•	RPC Client: We will connect to a Solana RPC endpoint for sending transactions and certain data queries. For mainnet, you can use a public endpoint (e.g. https://api.mainnet-beta.solana.com) or a provider like QuickNode/Helius for better performance (some advanced features like block subscriptions require special endpoints ￼). Initialize the RPC client and websocket URL in a config:
+
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+
+pub struct SolanaConfig {
+    pub rpc_url: String,
+    pub ws_url: String,
+    pub rpc_client: RpcClient,
+}
+
+impl SolanaConfig {
+    pub fn new(rpc_url: &str, ws_url: &str) -> Self {
+        SolanaConfig {
+            rpc_url: rpc_url.to_string(),
+            ws_url: ws_url.to_string(),
+            rpc_client: RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed()),
+        }
+    }
+}
+
+// Usage:
+let config = SolanaConfig::new(
+    "https://api.mainnet-beta.solana.com",
+    "wss://api.mainnet-beta.solana.com"  // WebSocket for subscriptions
+);
+
+The RpcClient will be used for standard requests (e.g. fetching balances, sending transactions), while the ws_url is used for real-time subscription to Pump.fun events. We use confirmed commitment for a balance between speed and reliability.
+
+	•	Constants: In a config.rs, define constants such as the Pump.fun program ID and our fixed buy amount, slippage, etc.:
+
+pub const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";  // Pump.fun main program ID [oai_citation:10‡docs.chainstack.com](https://docs.chainstack.com/docs/solana-creating-a-pumpfun-bot#:~:text=The%20bot%20subscribes%20over%20WebSocket,fun%20main%20program%20ID%3A%206EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)
+pub const BUY_AMOUNT_SOL: f64 = 0.1;       // Use 0.1 SOL per new token
+pub const SLIPPAGE_BPS: u64 = 50;         // 0.5% slippage tolerance (50 basis points) [oai_citation:11‡quicknode.com](https://www.quicknode.com/docs/solana/pump-fun-swap#:~:text=slippageBps)
+
+Note: Pump.fun tokens use 6 decimal places instead of the usual 9 for SPL tokens ￼. The bot will need to handle token amounts accordingly (the Jupiter API accounts for this automatically, as we’ll see).
+
+With the wallet and config in place, we can proceed to the core functionality.
+
+Monitoring New Token Launches on Pump.fun
+
+The first major task is detecting when a new token is launched on Pump.fun. Pump.fun’s on-chain program emits a “create” instruction each time someone starts a new coin ￼. We will capture these events in real-time using Solana’s PubSub (websocket) API. There are a couple of approaches:
+	•	Block Subscription: Subscribe to all confirmed blocks and filter transactions for those that invoke the Pump.fun program’s create instruction. This was the approach in Chainstack’s Python bot ￼. It’s very fast but requires your RPC to enable --rpc-pubsub-enable-block-subscription (not all public RPCs do).
+	•	Logs Subscription: Subscribe to program logs for the Pump.fun program. If the program logs an event or if any transaction mentions the program, we get a callback. However, Pump.fun might not emit easily parseable logs for creation (Anchor events, if any, could be base64).
+	•	Program Account Subscription: Subscribe to all accounts owned by the Pump.fun program. When a new token is created, new accounts (the bonding curve state) are created/initialized, which triggers notifications ￼ ￼. By parsing the account data, we could identify the token mint and curve. This avoids needing special block subscriptions and works on standard RPC.
+
+For simplicity and reliability, we’ll use a logs subscription with a filter for Pump.fun’s program ID (which captures any transaction where that program is invoked) ￼. This is supported on stable websocket API:
+
+Here’s a snippet from monitor.rs that sets up a websocket connection and listens for new coin creation:
+
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_client::rpc_filter::RpcTransactionLogsFilter;
+use solana_transaction_status::UiMessage;
+
+pub async fn subscribe_new_tokens(ws_url: &str) -> anyhow::Result<()> {
+    // Connect to Solana websocket for logs
+    let (mut client, receiver) = PubsubClient::logs_subscribe(
+        ws_url,
+        RpcTransactionLogsFilter::Mentions(PUMPFUN_PROGRAM.parse()?),
+    ).await?;
+
+    println!("Subscribed to Pump.fun program logs...");
+
+    // Process incoming log messages
+    while let Some(log_notification) = receiver.recv().await {
+        if let Some(logs) = log_notification.value.logs {
+            // Check if the log corresponds to a 'create' instruction
+            if logs.iter().any(|line| line.contains("create")) {
+                // Fetch transaction details
+                let sig = log_notification.value.signature;
+                println!("New token creation detected! Tx: {}", sig);
+                // (Optionally, fetch transaction details to extract mint)
+                tokio::spawn(async move {
+                    if let Err(e) = handle_new_token(sig).await {
+                        eprintln!("Error handling new token: {:?}", e);
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+In this code:
+	•	We use PubsubClient::logs_subscribe with a filter RpcTransactionLogsFilter::Mentions(pubkey) to get logs of any transaction mentioning the Pump.fun program ID ￼. This captures the relevant transactions without flooding us with all logs.
+	•	For each log notification, we search for the keyword "create" to identify the Pump.fun create instruction. In Anchor-based programs, the first 8 bytes of the instruction correspond to a discriminator; it’s possible the string “create” is logged or part of the instruction name. If not, we may need to decode the instruction data to be certain (this requires the Pump.fun IDL and discriminator calculation, beyond scope here).
+	•	When a new token creation is identified, we spawn an async task to handle_new_token(signature). This function will gather the necessary info about the new token and initiate the buy. We offload to a new task so that the subscription loop continues listening without delay.
+
+Extracting Token Details: From the transaction signature of the create instruction, we need the new token’s mint address and its bonding curve account. We have two ways:
+	1.	Call getTransaction RPC for that signature (with encoding=jsonParsed) to parse the instruction data and accounts. The Pump.fun program likely takes the new mint and bonding curve as accounts in the instruction. We can locate them in the transaction message.
+	2.	Use Chainstack’s approach: they knew that the transaction would have logged or returned the three key accounts (mint, bonding curve, associated curve) and decoded them. We can simplify by fetching the transaction meta.
+
+For brevity, we’ll use the RPC call method:
+
+use solana_client::rpc_config::RpcTransactionConfig;
+use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding};
+
+async fn handle_new_token(tx_signature: String) -> anyhow::Result<()> {
+    let config = RpcTransactionConfig {
+        encoding: Some(UiTransactionEncoding::JsonParsed),
+        commitment: Some(CommitmentConfig::confirmed()),
+        max_supported_transaction_version: Some(0),
+    };
+    let tx_status = config.rpc_client.get_transaction(&tx_signature, config)?;
+    if let Some(tx) = tx_status.transaction {
+        // Find the mint address within the transaction instructions
+        if let EncodedTransaction::Json(tx_json) = tx {
+            // Simplified parsing: look for account keys that end with "pump" (pump fun mints have "...pump" suffix) [oai_citation:19‡apify.com](https://apify.com/muhammetakkurtt/pump-fun-new-token-transactions-monitor#:~:text=)
+            if let Some(accts) = tx_json.message.get("accountKeys") {
+                for acct in accts.as_array().unwrap() {
+                    let addr = acct.as_str().unwrap();
+                    if addr.ends_with("pump") {
+                        // Likely the new token mint (pump.fun devs often ensure the mint ends with "pump")
+                        let mint_address = addr.to_string();
+                        println!("New token mint: {}", mint_address);
+                        // Trigger buy for this token
+                        buy_new_token(mint_address).await?;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+Explanation: We request the transaction details and parse the JSON. Pump.fun token mint addresses typically have the literal string “pump” at the end as a convention ￼, which we exploit to identify the mint quickly. A more robust method is to use the known ordering of accounts in the create instruction (e.g. the mint might be at a fixed index in the instruction accounts list). For a production bot, integrating the official IDL to decode the instruction is ideal, but the above heuristic often works.
+	•	Initial Delay: It’s advisable to wait a short moment after detection before attempting the buy. Solana finality is fast, but the new token’s accounts might not be fully propagated instantly. The Chainstack bot uses a ~15 second cooldown to avoid race conditions right after creation ￼. In our implementation, we could sleep for a few seconds (e.g. tokio::time::sleep(Duration::from_secs(5)).await) before buying. This reduces the chance of transaction errors like “account not found” when trying to trade immediately after creation.
+
+Alternative Data Sources: If direct on-chain subscriptions are challenging, one could use:
+	•	Pump.fun API or Indexers: There is no official Pump.fun HTTP API for new tokens, but services like Moralis and Helius index these. For example, Moralis Solana API can list pump.fun tokens and pairs ￼. QuickNode offers a Pump.fun-specific swap endpoint and likely monitoring tools ￼. Using such APIs might simplify development at the cost of reliance on third-party services.
+	•	Scraping pump.fun: Pump.fun’s website likely lists new coins in real-time (perhaps via a WebSocket or polling mechanism). Reverse-engineering it is an option, but maintainability could be an issue if the site changes.
+
+In this guide, we stick with the on-chain subscription for immediacy and control.
+
+Filtering Potential Scam Tokens
+
+Not every new token is worth buying – many could be scams or rugs. Pump.fun’s fair launch design prevents classic liquidity rug-pulls (no removable liquidity; price is on a bonding curve), but scammers use tactics like wash trading (fake volume), micro-buying to simulate demand, and then bundled sell-offs to trap traders ￼ ￼. We should filter out obvious bad tokens to protect our wallet. Here are some filters and how to implement them:
+	1.	Creator Wallet Blacklist: Maintain a list of known scammer addresses (if community or personal research provides one). If the new token’s creator (traderPublicKey from creation data ￼) is on the blacklist, skip the buy. You could load a list from a file or online source.
+	2.	Repeat Creators: If the same wallet is creating multiple tokens in a short span, likely all are pump-and-dump attempts. We can keep a cache (in memory or a small DB) of recently seen creators and the number of tokens launched. For example:
+
+use std::collections::HashMap;
+static mut RECENT_CREATORS: HashMap<String, u32> = HashMap::new();
+
+fn is_creator_suspicious(creator: &str) -> bool {
+    unsafe {
+        let count = RECENT_CREATORS.entry(creator.to_string()).or_insert(0);
+        *count += 1;
+        if *count > 3 { // launched >3 tokens recently
+            return true;
+        }
+    }
+    false
+}
+
+If is_creator_suspicious returns true, we log and skip the token.
+
+	3.	Token Name/Symbol Checks: Pump.fun tokens often have meme names; however, scams might impersonate others. If the name/symbol exactly matches a known project or contains blacklisted terms, be cautious. (This might require fetching token metadata via getAccountInfo on the mint’s metadata PDA – beyond scope, but possible).
+	4.	Early Volume Pattern: After launching, if we observe the first few transactions are many small buys and one wallet buying a lot, that could indicate manipulation. An advanced bot might subscribe to the new token’s transactions for a few seconds to gauge distribution. In our case, we proceed with the buy quickly, but we could add logic to abort if something alarming is noticed (e.g., creator buying huge amounts immediately).
+	5.	Pump.fun Risk Scores: Use external tools like Solana Tracker’s risk score ￼ ￼. They evaluate factors such as top holders concentration, completeness of bonding curve, and social info. While not accessible in real-time via a simple API (unless provided), these insights suggest:
+	•	If one holder owns a large percentage early (e.g., >20% in top 10 holders ￼), that’s a red flag.
+	•	Bonding curve not complete means the token hasn’t reached its maximum supply on Pump.fun yet (normal for new tokens) ￼. Many scams never complete bonding (they rug earlier), but on the flip side, a token that does complete bonding may be more legitimate.
+	•	No social media in metadata ￼ – legitimate projects often update their token metadata URI with links; scams may not bother.
+
+In code, after extracting new token info, we can implement a check:
+
+struct TokenInfo { mint: String, creator: String /*, name, symbol, etc.*/ }
+
+fn passes_filters(info: &TokenInfo) -> bool {
+    // Blacklist check
+    let bad_creators = [ "Gh9scamDevAddress...", /* etc */ ];
+    if bad_creators.contains(&info.creator.as_str()) {
+        println!("Skipping token {} by blacklisted creator {}", info.mint, info.creator);
+        return false;
+    }
+    // Creator frequency check
+    if is_creator_suspicious(&info.creator) {
+        println!("Creator {} has launched many tokens recently. Skip {}", info.creator, info.mint);
+        return false;
+    }
+    // (Additional checks like name patterns can be added here)
+    true
+}
+
+Always log the reason for skipping a token for your records. In the future, you might refine these rules as you analyze the logged data.
+
+Remember: No filter is foolproof – this just reduces risk. Do your own research (DYOR) on tokens if possible. As a safety net, you could implement a “whitelist mode” where the bot only buys tokens whose creator is known/trusted or tokens that match certain positive criteria. Conversely, a very conservative approach is to start with minimal buys and use the subsequent price action as a signal (but the bot described here is an instant sniper, so we act immediately).
+
+Automated Purchase via Jupiter Aggregator
+
+Once a new token passes our filters, the bot will execute a buy transaction of 0.1 SOL worth of that token. Instead of interacting with the Pump.fun program directly, we leverage Jupiter, which is a one-stop aggregator for swaps on Solana. Jupiter has integrated Pump.fun’s liquidity (via PumpSwap or direct bonding curve) into its API ￼ ￼, making it straightforward to swap SOL for the new token.
+
+Why Jupiter? Jupiter’s API finds the best route and handles splitting among DEXes if needed. In the case of a newly launched token, the only source of liquidity is the Pump.fun bonding curve itself (or PumpSwap if the token “graduates”), so Jupiter will effectively route to that. Using Jupiter saves us from manually crafting the Pump.fun swap instruction (which QuickNode’s Pump.fun API does under the hood ￼ ￼).
+
+We use the jup-ag crate for Rust, which provides async functions to get quotes and swap transactions. Here’s how we perform the buy in our trade.rs module:
+
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signer;
+use solana_sdk::transaction::VersionedTransaction;
+use jup_ag::{quote, swap, QuoteConfig, SwapRequest};
+
+async fn buy_new_token(mint_addr: String) -> anyhow::Result<()> {
+    let user = get_trading_keypair();
+    let user_pubkey = user.pubkey();
+
+    // Jupiter uses wSOL token address to represent SOL in swaps
+    let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse()?;
+    let token_mint: Pubkey = mint_addr.parse()?;  // new token mint as Pubkey
+
+    // Ensure associated token account exists for the new token (needed to receive it)
+    let ata = spl_associated_token_account::get_associated_token_address(&user_pubkey, &token_mint);
+    if config.rpc_client.get_account(&ata).is_err() {
+        // Create ATA if not exists
+        let create_ata_ix = spl_associated_token_account::instruction::create_associated_token_account(
+            &user_pubkey, &user_pubkey, &token_mint
+        );
+        let ata_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &[create_ata_ix],
+            Some(&user_pubkey),
+            &[&user],
+            config.rpc_client.get_latest_blockhash()?
+        );
+        config.rpc_client.send_and_confirm_transaction(&ata_tx)?;
+        println!("Created ATA {} for token {}", ata, mint_addr);
+    }
+
+    // Prepare the swap: 0.1 SOL -> token, with slippage control
+    let amount_in_lamports = (BUY_AMOUNT_SOL * 1_000_000_000_f64) as u64;
+    let quote_resp = quote(
+        sol_mint, 
+        token_mint, 
+        amount_in_lamports, 
+        QuoteConfig { slippage_bps: Some(SLIPPAGE_BPS), ..Default::default() }
+    ).await?;
+    println!("Jupiter quote: {} SOL -> ~{} tokens (impact: {:.2}%)",
+             BUY_AMOUNT_SOL, quote_resp.out_amount, quote_resp.price_impact_pct);
+
+    // Build swap transaction
+    let swap_req = SwapRequest::new(user_pubkey, quote_resp);
+    let swap_tx = swap(swap_req).await?;  // This returns a partially signed VersionedTransaction [oai_citation:36‡docs.rs](https://docs.rs/jup-ag/latest/src/jup_ag/lib.rs.html#:~:text=321%20,quote_api_url) [oai_citation:37‡docs.rs](https://docs.rs/jup-ag/latest/src/jup_ag/lib.rs.html#:~:text=Result,last_valid_block_height)
+    let mut transaction: VersionedTransaction = swap_tx.swap_transaction;
+    // Sign the transaction with our wallet's Keypair
+    transaction.sign(&[&user], config.rpc_client.get_latest_blockhash()?);
+    // Send the transaction
+    let sig = config.rpc_client.send_and_confirm_transaction(&transaction)?;
+    println!("Buy transaction sent: {}", sig);
+
+    // After confirmed, log the balance received
+    if let Ok(balance) = config.rpc_client.get_token_account_balance(&ata) {
+        println!("Bought {} tokens (mint {}) into ATA {}", balance.amount, mint_addr, ata);
+    }
+    log_trade(format!("BUY {} {} (mint {}) @ {:.3} SOL", balance.amount, "<TOKEN>", mint_addr, BUY_AMOUNT_SOL));
+    Ok(())
+}
+
+Let’s break down the critical parts:
+	•	Associated Token Account (ATA): Before swapping, we ensure our wallet has an ATA for the new token. The Jupiter swap may create the ATA automatically if needed (it has wrap_and_unwrap_sol and use_shared_accounts to simplify user experience ￼), but we explicitly create it to be safe and to avoid any extra overhead in the swap transaction. We use the SPL Associated Token Account program’s helper function to create the instruction. We then send a transaction to create the ATA. This transaction is signed and confirmed separately.
+	•	Quote from Jupiter: We call jup_ag::quote with:
+	•	input_mint = So111... (the special constant for SOL as input),
+	•	output_mint = token_mint (the new token),
+	•	amount = 0.1 SOL in lamports (1 SOL = 1e9 lamports),
+	•	QuoteConfig with slippage_bps = 50 (0.5%). We leave other fields default: swap_mode defaults to “ExactIn” (we are spending an exact amount of SOL), and only_direct_routes=false allows Jupiter to route freely (not an issue here, only one route exists).
+Jupiter returns a Quote struct containing the estimated out_amount of tokens we’ll receive, and the price_impact_pct which indicates slippage/impact on the market price ￼. We print these for info.
+	•	Swap Transaction: Next, we create a SwapRequest with our user pubkey and the quote, then call jup_ag::swap. Jupiter’s API responds with a base64 encoded transaction which the crate automatically deserializes into a VersionedTransaction object (with message, recent blockhash, and any required instructions) ￼ ￼. This transaction is partially signed — typically, Jupiter will have included some instructions that might involve their fee accounts or DEX program accounts. We still need to sign with our user key to authorize spending our SOL and receiving tokens. We sign using the transaction.sign(&[&user], recent_blockhash) pattern.
+	•	Send and Confirm: We use the RPC client to send the signed transaction and wait for confirmation. If this fails (network issue, blockhash expired, etc.), the error is caught. We should implement a retry mechanism: e.g., if the error indicates "Blockhash not found" or a simulation failure, fetch a new quote and attempt again. In production, wrap this in a loop with a counter for a few retries.
+	•	Post-Buy Logging: After a successful buy, we query our ATA balance to see how many tokens were actually received. Jupiter’s estimate is usually accurate, but getting the actual amount from on-chain ensures accuracy. We log the result with log_trade – a helper to append to our trades log file (we’ll implement logging soon).
+
+Slippage: We set 0.5% slippage. This means if the price moves more than 0.5% unfavorable between quoting and executing, the transaction will fail (Jupiter’s swap uses a slippage limit in the instructions). This protects us from drastic price swings (which are common in the first seconds of launch!). You can adjust this value; tighter slippage means more safety against bad fills but higher chance of the transaction failing if price is volatile.
+
+Decimal Handling: Because Pump.fun tokens have 6 decimals, one might think we need to adjust calculations. However, when we specify the swap amount in lamports (input SOL), Jupiter returns out_amount which is already in the token’s smallest units (so if it says 50000000, that is 50.000000 tokens for a 6-decimal token). We don’t need special-case code; just be mindful if doing any manual math with token amounts.
+
+Price Tracking and Sell Logic
+
+After buying the token, the bot transitions to monitoring the token’s price and waiting for profit targets (4× and 8×) to trigger sells. We will leverage Jupiter’s Price API to get continuous updates on the token’s value. Jupiter provides a convenient endpoint to fetch the unit price of a token in terms of another token (e.g. in SOL or USDC) ￼. The jup-ag crate has a function price(input_mint, output_mint, ui_amount) which returns a Price struct with a price field (f64) representing how much output token is needed per input token ￼ ￼.
+
+For our use case:
+	•	We want the price of 1 unit of the new token in SOL (since we bought with SOL and will sell back to SOL).
+	•	So we call price(token_mint, sol_mint, 1.0) which gives us the SOL amount required to buy 1 token (this can be considered the current price per token in SOL) ￼.
+
+Let’s implement a monitoring loop (this could run in its own async task or thread) that periodically checks the price and triggers sells:
+
+use std::time::Duration;
+use jup_ag::price;
+
+async fn monitor_and_sell(token_mint: Pubkey, initial_price_sol: f64, mut half_sold: bool) -> anyhow::Result<()> {
+    let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse()?;
+    let user = get_trading_keypair();
+    let user_pubkey = user.pubkey();
+    let ata = spl_associated_token_account::get_associated_token_address(&user_pubkey, &token_mint);
+    let total_tokens = config.rpc_client.get_token_account_balance(&ata)?.amount.parse::<u64>()?;
+    let half_tokens = total_tokens / 2;
+    println!("Monitoring price for sell targets... Initial price = {:.6} SOL", initial_price_sol);
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;  // check every 10 seconds
+        let price_resp = price(token_mint, sol_mint, 1.0).await?;
+        let current_price = price_resp.price;
+        // Calculate multiples of initial price
+        let multiple = current_price / initial_price_sol;
+        println!("Price now: {:.6} SOL ({}×)", current_price, multiple);
+        if !half_sold && multiple >= 4.0 {
+            // Sell half
+            println!("Target 4x reached for {}! Selling half...", token_mint);
+            sell_token(token_mint, half_tokens).await?;
+            half_sold = true;
+            log_trade(format!("SELL-HALF {} (mint {}) @ {:.6} SOL (≈4x)", half_tokens, token_mint, current_price));
+        }
+        if half_sold && multiple >= 8.0 {
+            // Sell remaining
+            let remaining = config.rpc_client.get_token_account_balance(&ata)?.amount.parse::<u64>()?;
+            println!("Target 8x reached for {}! Selling remaining {} tokens...", token_mint, remaining);
+            sell_token(token_mint, remaining).await?;
+            log_trade(format!("SELL-ALL {} (mint {}) @ {:.6} SOL (≈8x)", remaining, token_mint, current_price));
+            break; // done monitoring this token
+        }
+    }
+    Ok(())
+}
+
+Key points in this snippet:
+	•	We determine initial_price_sol (the price per token at purchase time). This can be derived from the quote or from a direct price query right after buying. For precision, you could compute initial_price_sol = BUY_AMOUNT_SOL / (total_tokens_received / 10^6) to get SOL per token.
+	•	We fetch the total tokens bought from our ATA and compute half_tokens.
+	•	The loop sleeps for 10 seconds between price checks – adjust this frequency as needed (5-10 seconds is usually fine; 1 second might be unnecessarily fast and could hit rate limits).
+	•	We get current_price in SOL for 1 token. Then we compute multiple = current_price / initial_price_sol to see how many times the price has grown.
+	•	If we haven’t sold half yet and the price is ≥4× initial, we execute sell_token for half_tokens. We mark half_sold = true and log the event.
+	•	If already sold half and price ≥8×, we sell everything remaining and break out of the loop for this token.
+
+Selling via Jupiter: The sell_token function will be similar to the buy, but swapping in the reverse direction. We provide input_mint = token_mint, output_mint = So111... (SOL), and amount = tokens_to_sell in the token’s base units. Jupiter’s aggregator will route the sell through the bonding curve. Example implementation:
+
+async fn sell_token(token_mint: Pubkey, token_amount: u64) -> anyhow::Result<()> {
+    let user = get_trading_keypair();
+    let user_pubkey = user.pubkey();
+    let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse()?;
+
+    // Jupiter quote for selling tokens for SOL
+    let quote_resp = quote(
+        token_mint,
+        sol_mint,
+        token_amount,
+        QuoteConfig { slippage_bps: Some(SLIPPAGE_BPS), swap_mode: Some(jup_ag::SwapMode::ExactIn), ..Default::default() }
+    ).await?;
+    println!("Jupiter quote (sell): {} tokens -> ~{} lamports SOL (impact: {:.2}%)",
+             token_amount, quote_resp.out_amount, quote_resp.price_impact_pct);
+
+    let swap_req = SwapRequest::new(user_pubkey, quote_resp);
+    let swap_tx = swap(swap_req).await?;
+    let mut transaction = swap_tx.swap_transaction;
+    transaction.sign(&[&user], config.rpc_client.get_latest_blockhash()?);
+    let sig = config.rpc_client.send_and_confirm_transaction(&transaction)?;
+    println!("Sell transaction sent: {}", sig);
+    Ok(())
+}
+
+This mirrors the buy process:
+	•	We use SwapMode::ExactIn to sell exactly the given number of tokens (we could also consider ExactOut if we wanted to ensure a certain SOL output, but here we sell everything).
+	•	We apply the same slippage tolerance.
+	•	After sending, one might again confirm via get_balance that the SOL was received. The SOL will go to our main wallet account (since Jupiter will unwrap any wSOL to SOL for us, given wrap_and_unwrap_sol: Some(true) in the default SwapRequest ￼).
+
+Partial Fills: On Pump.fun bonding curves, selling a large amount can significantly drop the price. The Jupiter quote’s out_amount is how much SOL we expect, but if the market impact is high (price impact percentage is large), our sale might yield less than a simple multiple calculation would suggest. Since we’re selling in two tranches, this mitigates some risk and locks some profit at 4×. Always consider the trade-off between maximizing profit and ensuring you actually realize gains.
+
+Edge Cases:
+	•	If the price pumps extremely fast (say 8× in seconds) and then crashes, our loop might miss selling at 4×. In our logic, if it’s already above 8×, the first condition triggers at ≥4× (so we would still sell half at that moment, then the second triggers immediately after if ≥8×). However, if it overshoots 8× before we even check the first time, we’ll do the half sale at ≥4× anyway (taking profit a bit late, but still profit), then immediately do final sale at ≥8×. This is acceptable. We just need to ensure the code can handle back-to-back triggers (our code does one iteration at a time, so in one iteration it could potentially satisfy both conditions if we structured it differently; but here we break after final sale).
+	•	If the price never reaches 4× and instead dumps, the loop runs indefinitely. You might want to add a stop-loss or timeout – e.g., if price drops below a certain fraction of initial (maybe 0.5×) or if some time (like 1 hour) passes with no triggers, either sell at market or move on. In this guide, we focus on the upside targets only.
+
+Logging and Persistent Tracking
+
+Logging is crucial for analyzing the bot’s performance and debugging issues. We’ll implement two forms of logging:
+	1.	Trade Log File: A plaintext log (trades.log) where each buy/sell event is appended with details (timestamp, token, amounts, price, etc.).
+	2.	In-Memory Stats: We can keep counters of number of tokens sniped, wins vs losses, total profit in SOL, etc., to display on the CLI/TUI.
+
+For simplicity, we use Rust’s standard file I/O for logging. Create a logger.rs:
+
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::Utc;
+
+pub fn log_trade(entry: String) {
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S");
+    let log_line = format!("[{}] {}\n", timestamp, entry);
+    println!("{}", log_line);  // also print to console
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("trades.log")
+        .expect("Cannot open log file");
+    if let Err(e) = file.write_all(log_line.as_bytes()) {
+        eprintln!("Failed to write to log file: {}", e);
+    }
+}
+
+We use the chrono crate for timestamps (you can also use std::time but chrono makes formatting easy). Each log line gets a UTC timestamp. We print it to console for immediate feedback and also append to trades.log. Over time, this log will contain a history of all tokens bought and sold, which you can analyze to refine your strategy (perhaps with a Python script or spreadsheet).
+
+Wallet Balance Tracking: We might log the wallet’s SOL balance after each trade to see profit realized. For example, modify log_trade calls:
+	•	After a buy, we can log how much SOL was spent and remaining SOL. (We know we spent 0.1 SOL, so remaining = old_balance - 0.1, which we can fetch via config.rpc_client.get_balance(&user_pubkey)).
+	•	After sells, log how much SOL gained (difference before vs after, or use the Jupiter quote’s out_amount as a proxy).
+
+Example enhancement:
+
+let balance_sol = config.rpc_client.get_balance(&user_pubkey)? as f64 / 1e9;
+log_trade(format!("SELL-ALL {} tokens (mint {}) @ {:.6} SOL each, new SOL balance = {:.3} SOL",
+           remaining, token_mint, current_price, balance_sol));
+
+Be mindful that querying balance too often can hit rate limits; logging after each confirmed trade is fine.
+
+Data Persistence: The log file ensures we don’t lose trade data if the bot restarts. For more structured data, consider logging to a CSV or database (SQLite, etc.) with fields like token mint, buy_time, sell_time, buy_price, sell_price, profit, etc. This can feed into a portfolio tracker or analytics dashboard later.
+
+Building a CLI Dashboard
+
+Running the bot headless is fine, but having a simple interface to observe its operations in real-time is very useful. We will implement a basic console UI that lists active snipes and their status. This could be as simple as printing updates to stdout (which we already do), or as fancy as a full-text UI (TUI) application with dynamic tables.
+
+Option 1: Periodic Status Printouts – The easiest approach is to periodically print a summary of all ongoing and finished trades. For instance, every minute, output:
+
+Active tokens: 2 | Completed: 5 (3 wins, 2 losses) | Total P/L: +0.5 SOL
+- Token X...pump: Bought at 0.002 SOL, current 0.0035 (+75%), target 4x=0.008
+- Token Y...pump: Bought at 0.0005 SOL, sold half @0.002, remaining target 0.004
+
+This can be done by maintaining a global list or struct of active trades and their info, updated by the monitor tasks. A simple loop can render this.
+
+Option 2: Interactive TUI – For a richer experience, use crates like ratatui (formerly tui-rs) or crossterm to create a live-updating dashboard in the terminal. You could have multiple panels: one for active trades (with progress towards targets), one for completed trades (with profit/loss), and maybe a log panel for recent actions. Detailing a full TUI is beyond the scope here, but here’s a conceptual snippet using ratatui:
+
+// Pseudocode for a TUI using ratatui
+use ratatui::{Terminal, backend::CrosstermBackend, widgets::{Block, Borders, Table}, layout::{Layout, Constraint}};
+
+fn draw_ui(trades: &TradeBook) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableRawMode)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    loop {
+        terminal.draw(|frame| {
+            let chunks = Layout::default()
+                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+                .split(frame.size());
+            // Active trades table
+            let rows: Vec<_> = trades.active.iter().map(|t| {
+                Row::new(vec![
+                    t.token_symbol.clone(),
+                    format!("{:.3}", t.buy_price),
+                    format!("{:.3}", t.current_price),
+                    format!("{:.1}%", (t.current_price/t.buy_price - 1.0) * 100.0),
+                    format!("{}%", t.progress_to_target()),
+                ])
+            }).collect();
+            let table = Table::new(rows)
+                .header(Row::new(vec!["Token", "Buy@SOL", "Current SOL", "Change", "Progress"]))
+                .block(Block::default().borders(Borders::ALL).title("Active Trades"));
+            frame.render_widget(table, chunks[0]);
+            // Completed trades or logs can be shown in chunks[1]
+        })?;
+        // break or continue based on user input, etc.
+    }
+}
+
+This is a lot to implement, but the result is a nice dashboard.
+
+For our guide, we’ll assume a simpler approach: print important events and perhaps allow some basic interaction:
+	•	For example, pressing Ctrl+C could gracefully shut down the bot (closing subscriptions, saving state).
+	•	We might not implement interactive commands, but you could extend the bot to accept keyboard input to print an instant status, pause sniping, or skip a token, etc.
+
+Visualization Tip: Since the bot logs to trades.log, you can also use external tools to visualize performance. Import the log into a spreadsheet to calculate success rate, average ROI, etc. For real-time alerts, we’ll discuss Discord integration next.
+
+Deployment, Continuous Running, and Safety
+
+Now that the core functionality is built, running the bot reliably 24/7 is the next challenge. We recommend using Docker to containerize the application, making it easy to run on a server (Ubuntu or any OS). A basic Docker setup:
+
+Dockerfile:
+
+# Build stage
+FROM rust:1.70 as builder
+WORKDIR /app
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs 
+RUN cargo build --release || true
+# Copy actual source
+COPY src ./src
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:buster-slim
+WORKDIR /app
+# We need OpenSSL for RPC TLS, ensure it's installed
+RUN apt-get update && apt-get install -y libssl1.1 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/pumpfun_sniper .
+COPY trades.log .  # if you want to preserve logs across builds (optional)
+CMD ["./pumpfun_sniper"]
+
+Build this with docker build -t pumpfun-sniper . and run with docker run -d --name sniperbot pumpfun-sniper. Map volumes or ports as needed (though our app doesn’t serve external requests, so no ports required). You might mount a volume for the log file if you want to access it from the host.
+
+Automatic Restarts: Use Docker’s restart policy (--restart unless-stopped) so the container restarts if it crashes. Alternatively, use a process manager on the host if not using Docker.
+
+RPC Reliability & Rate Limits: Running 24/7 means handling intermittent network or RPC failures:
+	•	Use a robust RPC provider. Public endpoints might throttle or have downtime. A dedicated provider (QuickNode, Alchemy, Triton, etc.) or running your own Solana node (if you can) will help. Some providers offer higher rate limits and priority for Pump.fun given its high TX throughput.
+	•	Implement retry logic around critical RPC calls (we touched on this for transactions). For example, if send_and_confirm_transaction fails due to a network error, catch it and retry a couple times with exponential backoff.
+	•	For subscriptions, if the websocket drops (the loop ends), wrap it in a reconnect logic. E.g., if receiver.recv().await returns None (connection closed), attempt to create a new PubsubClient::logs_subscribe and continue. Also handle tokio::select! with a heartbeat to know if no messages have come in for a while, perhaps reconnect.
+
+Security Best Practices:
+	•	Key Safety: If possible, do not keep large amounts of SOL on the hot wallet that the bot uses. Keep just enough for sniping. This limits damage if the server is compromised. Also, use OS-level protections: the key file should have restrictive permissions and memory handling should avoid leaving secrets in logs.
+	•	Locking Dependencies: To avoid supply-chain attacks, lock your Rust dependencies and consider verifying the jup-ag crate’s integrity, since it interacts with your funds.
+	•	Rate Limiting: Ensure the bot doesn’t enter any tight uncontrolled loops that hammer the RPC or Jupiter API. Our design uses reasonable delays. If you implement more frequent checks or multiple concurrent snipes, consider using a token bucket algorithm or simply adding small randomized sleep to avoid patterns that look like a DDOS. Jupiter’s API might also have rate limits, so handle HTTP 429 responses (if any) by backing off.
+	•	Error Logging: Log errors to a separate file or with distinct markers, so you can monitor if the bot is encountering many failures (could indicate an RPC issue or a bug).
+	•	Monitoring & Alerts: Integrate with Discord or email for critical alerts. For example, if a big sell happens (profit realized) or if the bot’s process restarts, send a Discord message. You can use a simple webhook:
+
+async fn notify_discord(message: &str) {
+    let url = std::env::var("DISCORD_WEBHOOK_URL").expect("Webhook URL not set");
+    let payload = serde_json::json!({ "content": message });
+    let _ = reqwest::Client::new().post(&url).json(&payload).send().await;
+}
+
+Then call notify_discord on events like a completed trade or on shutdown. This way, you get near-real-time updates on your phone/PC about the bot’s major actions.
+
+Finally, testing your bot before going live is crucial:
+	•	Run it on Solana’s devnet or a local test validator. While Pump.fun itself is mainnet-only, you can simulate parts: maybe tweak the code to listen to a known program on devnet and trigger dummy buys, or simply test the Jupiter swap logic with a small known token on devnet.
+	•	Use dry-run mode: you could add a config flag to not actually send transactions but log what it would do. This is useful to ensure your detection and filtering works without risking funds.
+	•	When confident, start with very small SOL amounts (0.01 SOL) to limit losses while observing performance.
+
+Advanced Features and Final Tips
+
+We’ve built a functional sniper bot, but there’s always room to enhance:
+	•	Dynamic Trade Parameters: Instead of a fixed 0.1 SOL, adjust position size based on available balance or confidence in the token. For example, if a token’s creator has a good reputation, invest more.
+	•	Multiple Sell Targets: We used two targets (4×, 8×). Some bots scale out more gradually (e.g., 25% at 2×, 25% at 4×, 25% at 6×, 25% at 8×) or even trail stop-loss orders. You could implement a trailing take-profit: e.g., if it hits 8×, keep holding until it falls back to 6× then sell.
+	•	Rug Detection Reaction: If you notice a token’s price suddenly plunges (e.g., someone dumped a ton, possibly the dev), you might want to cut losses. We didn’t implement stop-loss, but it’s wise. For instance, if price drops below 50% of initial, sell everything to salvage funds.
+	•	Concurrent Snipes: The bot can handle one token at a time as written. In reality, Pump.fun might have multiple new tokens in a minute. Our architecture can snipe multiple concurrently – the subscription will catch all, and we spawn a new handle_new_token task for each. Ensure shared resources (like the RPC client) can handle concurrent requests (the Solana RpcClient is not thread-safe by default; consider using the nonblocking version or creating separate clients per task, or use a Arc<Mutex<...>> around it). Jupiter’s API can also be called concurrently, but beware of rate limits if many tokens launch at once.
+	•	Analytics and Machine Learning: With enough log data, you can analyze which trades were profitable (by time of day, token type, etc.) and even train models to predict which tokens will pump. That’s beyond coding – but your comprehensive logs enable it.
+	•	Community & Updates: Keep an eye on Pump.fun and Solana updates. Pump.fun might change its program (though unlikely without a new program ID), Jupiter might update APIs (e.g., V6 to V7), etc. Staying active in developer discords and forums helps catch changes early.
+
+Rug Avoidance Suggestions: From community wisdom, here’s a summary of how to avoid Pump.fun scams ￼:
+	•	Research the creator wallet history (did they rug previous tokens?).
+	•	Watch out for wash trading patterns (multiple rapid buys in identical amounts = likely bots).
+	•	Verify if the token contract (in Pump.fun’s case, the concept of “contract” is the global program, so this is fine; but if it migrates to a real SPL token on Serum, ensure it’s the correct one and not an imitation).
+	•	Confirm the token’s authenticity – on Pump.fun, every token is new, so authenticity means checking if it’s not named after an existing project to deceive people.
+	•	Ensure there is real community or social presence if you plan to hold longer; otherwise, this is pure momentum trading.
+
+By following these, our bot’s filters can be refined over time.
+
+⸻
+
+Conclusion: We’ve constructed a full-length technical solution in Rust for a Pump.fun sniper bot. This bot listens to on-chain events, executes trades via Jupiter with controlled slippage, and manages the lifecycle of a trade (from entry to exit) automatically. It logs and displays information for the user and is built with modularity and safety in mind. Use this knowledge responsibly and be aware that automating trading in such a volatile environment carries financial risk. Test thoroughly, start small, and continuously improve your bot with the data it gathers. Good luck and happy sniping!
