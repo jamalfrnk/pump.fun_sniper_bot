@@ -16,8 +16,8 @@ const SUSPICIOUS_TOKEN_NAMES = [
 
 // Structure for application configuration
 function loadConfig() {
-  // Use the standard RPC URL 
-  const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  // Prioritize Alchemy RPC URL if available, fallback to standard RPC
+  const rpcUrl = process.env.ALCHEMY_RPC_URL || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
   
   return {
     rpcUrl: rpcUrl,

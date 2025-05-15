@@ -2,21 +2,22 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const logger = require('./logger');
 
 // Define a pool of RPC endpoints for production use
-// Prioritize endpoints that allow getProgramAccounts and have higher rate limits
+// Prioritize premium endpoints that allow getProgramAccounts and have higher rate limits
 const HTTP_RPC_ENDPOINTS = [
-  'https://api.mainnet-beta.solana.com',             // Official but limited
+  process.env.ALCHEMY_RPC_URL,                       // Premium Alchemy endpoint (primary)
+  'https://api.mainnet-beta.solana.com',             // Official but limited (backup)
   'https://solana-api.projectserum.com',             // Backup
   'https://rpc.ankr.com/solana',                     // Good general purpose endpoint
   'https://solana-mainnet.public.blastapi.io',       // Decent free tier
-  'https://mainnet-beta.solflare.network',           // Additional backup
-];
+].filter(Boolean); // Filter out any undefined values
 
 // Define a pool of WebSocket endpoints for production use
 const WS_RPC_ENDPOINTS = [
-  'wss://api.mainnet-beta.solana.com',               // Official WebSocket
+  process.env.ALCHEMY_WS_URL,                        // Premium Alchemy WebSocket (primary)
+  'wss://api.mainnet-beta.solana.com',               // Official WebSocket (backup)
   'wss://rpc.ankr.com/solana/ws',                    // Good alternate
   'wss://solana-mainnet.public.blastapi.io',         // Another option
-];
+].filter(Boolean); // Filter out any undefined values
 
 // Track which endpoint we're on
 let httpIndex = 0;
