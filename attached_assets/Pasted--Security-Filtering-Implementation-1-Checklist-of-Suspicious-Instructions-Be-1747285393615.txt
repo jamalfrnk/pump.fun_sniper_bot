@@ -1,0 +1,194 @@
+**🔍 Security Filtering Implementation**
+
+---
+
+### 1. Checklist of Suspicious Instructions
+
+Before buying any new token, reject it if its program or mint account supports any of:
+
+* **MintTo / MintToChecked** — ability to mint arbitrary new tokens
+* **Burn / BurnChecked** — ability to burn tokens (could be used to deplete your holdings)
+* **SetAuthority** — changing mint or freeze authority to a malicious key
+* **FreezeAccount / ThawAccount** — locking your ATA so you can’t move tokens
+* **CloseAccount** — forcibly closing your ATA or main account
+* **SystemProgram.transfer** in a CPI — moving SOL out of your wallet
+* **SPL TokenProgram.transfer** in a CPI with unexpected source/destination
+* **Any unknown CPI** to a non-trusted program ID
+
+---
+
+### 2. `security.js`
+
+```js
+// security.js
+import fs from 'fs';
+import { PublicKey } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+
+// Disallowed instruction names / program IDs
+const DISALLOWED_INSTRUCTIONS = new Set([
+  "mintTo", "mintToChecked",
+  "burn", "burnChecked",
+  "setAuthority",
+  "freezeAccount", "thawAccount",
+  "closeAccount"
+]);
+const DISALLOWED_PROGRAMS = new Set([
+  TOKEN_PROGRAM_ID.toBase58(),        // SPL Token program itself can be misused
+  "11111111111111111111111111111111"  // SystemProgram (for SOL transfers)
+]);
+
+/**
+ * Fetch and parse a mint account to check its authorities.
+ */
+export async function checkMintAuthorities(connection, mintPubkeyStr) {
+  const mintPubkey = new PublicKey(mintPubkeyStr);
+  const resp = await connection.getParsedAccountInfo(mintPubkey);
+  const info = resp.value?.data?.parsed?.info;
+  if (!info) throw new Error("Failed to parse mint account");
+
+  const { mintAuthority, freezeAuthority } = info;
+  // Only allow the Pump.fun bonding curve program as authority
+  const allowedAuthority = process.env.PUMPFUN_AUTHORITY_PUBKEY;
+  if (mintAuthority !== allowedAuthority || freezeAuthority !== allowedAuthority) {
+    throw new Error(`Authority mismatch: mintAuthority=${mintAuthority}, freezeAuthority=${freezeAuthority}`);
+  }
+  return true;
+}
+
+/**
+ * Decode a transaction and scan its instructions for disallowed ops.
+ */
+export async function scanTransactionForBackdoors(connection, signature) {
+  const tx = await connection.getParsedTransaction(signature, { encoding: 'jsonParsed' });
+  if (!tx) throw new Error(`Transaction not found: ${signature}`);
+
+  for (const instr of tx.transaction.message.instructions) {
+    const { program, parsed } = instr;
+    const programId = program || instr.programId; // fallback
+    if (DISALLOWED_PROGRAMS.has(programId)) {
+      const ixName = parsed?.type || instr.programInstruction;
+      if (DISALLOWED_INSTRUCTIONS.has(ixName)) {
+        return { found: true, programId, ixName };
+      }
+    }
+    // Also check any inner instructions
+    if (tx.meta?.innerInstructions) {
+      for (const inner of tx.meta.innerInstructions) {
+        for (const in2 of inner.instructions) {
+          const pid = in2.programId.toString();
+          const name = in2.parsed?.type;
+          if (DISALLOWED_PROGRAMS.has(pid) && DISALLOWED_INSTRUCTIONS.has(name)) {
+            return { found: true, programId: pid, ixName: name };
+          }
+        }
+      }
+    }
+  }
+  return { found: false };
+}
+
+/**
+ * Main filter: returns true if token is safe to buy.
+ */
+export async function filterScamTokens(connection, mintPubkeyStr, creationSig) {
+  try {
+    // 1) Check mint authorities
+    await checkMintAuthorities(connection, mintPubkeyStr);
+
+    // 2) Scan the creation transaction for backdoors
+    const scan = await scanTransactionForBackdoors(connection, creationSig);
+    if (scan.found) {
+      throw new Error(`Disallowed instruction ${scan.ixName} in program ${scan.programId}`);
+    }
+
+    // Safe to proceed
+    return true;
+  } catch (err) {
+    // Log and skip
+    await import('./logger.js').then(m => m.logSuspicious({
+      mint: mintPubkeyStr,
+      signature: creationSig,
+      reason: err.message
+    }));
+    return false;
+  }
+}
+```
+
+---
+
+### 3. `logger.js`
+
+```js
+// logger.js
+import fs from 'fs';
+import { format } from 'date-fns';
+
+const LOG_PATH = './suspicious.log';
+
+/**
+ * Append a JSON‐structured entry to suspicious.log
+ */
+export function logSuspicious({ mint, signature, reason }) {
+  const timestamp = format(new Date(), 'yyyy-MM-dd HH:mm:ss');
+  const entry = { timestamp, mint, signature, reason };
+  fs.appendFileSync(LOG_PATH, JSON.stringify(entry) + '\n');
+  console.warn(`Logged suspicious token: ${JSON.stringify(entry)}`);
+}
+```
+
+---
+
+### 4. Integration Guide
+
+In your new‐token handler (before any buy logic), replace:
+
+```js
+// OLD: immediate buy
+// buyToken(mintPubkey, creationSig);
+```
+
+with:
+
+```js
+import { filterScamTokens } from './security.js';
+
+async function onNewTokenDetected(mintPubkey, creationSig) {
+  const connection = getHttpConnection();
+  const safe = await filterScamTokens(connection, mintPubkey, creationSig);
+  if (!safe) {
+    console.log(`🔒 Skipped suspicious token ${mintPubkey}`);
+    return;
+  }
+  // Proceed with quote & buy
+  await buyToken(mintPubkey);
+}
+```
+
+Ensure this check runs **before** any calls to Jupiter or `connection.requestAirdrop`.
+
+---
+
+### 5. Why `onProgramAccountChange` Doesn’t Show Logs
+
+* `onProgramAccountChange` streams **account data updates** only (i.e., when the account’s lamports or data field changes). It does **not** include the transaction’s instruction list or logs.
+* To inspect **which instructions** ran (and catch malicious CPIs), you must subscribe to **logs** or fetch the full transaction:
+
+  * **Logs subscription**:
+
+    ```js
+    connection.onLogs(
+      'all', // or specific signature
+      (logInfo) => console.log(logInfo.logs),
+      'confirmed'
+    );
+    ```
+  * **Fetch parsed transaction**:
+
+    ```js
+    const tx = await connection.getParsedTransaction(sig, { encoding: 'jsonParsed' });
+    console.log(tx.transaction.message.instructions);
+    ```
+
+Use these methods to see the exact instruction names and program IDs, which allows you to detect and block any “backdoor” operations before your bot interacts with a token contract.

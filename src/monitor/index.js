@@ -2,6 +2,7 @@ const { PublicKey, Connection } = require('@solana/web3.js');
 const logger = require('../utils/logger');
 const { PUMPFUN_PROGRAM_ID } = require('../config');
 const { isTokenSafe } = require('../filter');
+const { isTokenSecure } = require('../security');
 const trader = require('../trader');
 const { getHttpConnection, getWsConnection, retryRpc, getConnectionEndpoint } = require('../utils/rpc');
 
@@ -30,8 +31,12 @@ class TokenPosition {
     this.tokenAmount = tokenAmount;
     this.currentPrice = buyPrice;
     this.buyTime = new Date();
-    this.profitTarget1 = null;  // Will be set after construction
-    this.profitTarget2 = null;  // Will be set after construction
+    // Multi-tiered profit targets (will be set from config after construction)
+    this.profitTarget1 = null;  // 1.3x - Sell 15%
+    this.profitTarget2 = null;  // 2.0x - Sell 50%
+    this.profitTarget3 = null;  // 3.0x - Sell 15%
+    this.profitTarget4 = null;  // 4.0x - Sell 15%
+    this.profitTarget5 = null;  // 8.0x - Sell 5%
     this.soldPercentage = 0;
     this.lastUpdated = new Date();
     this.status = 'Active';
@@ -150,13 +155,22 @@ async function startSimulationMode(config, keypair, activeTokens) {
     
     // Process with normal flow
     try {
-      // Filter using real filtering logic
+      // Step 1: Basic filtering using real filtering logic
       if (!await isTokenSafe(tokenInfo)) {
-        logger.warn(`[SIMULATION] Token ${tokenInfo.name} did not pass safety filters, skipping`);
+        logger.warn(`[SIMULATION] Token ${tokenInfo.name} did not pass basic safety filters, skipping`);
         continue;
       }
       
-      logger.info(`[SIMULATION] Token ${tokenInfo.name} passed safety filters, simulating buy`);
+      // Step 2: In simulation mode, we randomly decide if the token passes advanced security checks
+      // This simulates some tokens failing the malicious code detection
+      const securityCheckPassed = Math.random() > 0.3; // 70% chance of passing
+      
+      if (!securityCheckPassed) {
+        logger.warn(`[SIMULATION] Token ${tokenInfo.name} failed advanced security checks, potential scam detected`);
+        continue;
+      }
+      
+      logger.info(`[SIMULATION] Token ${tokenInfo.name} passed all safety filters, simulating buy`);
       
       // Simulate a buy (no real transaction)
       const simulatedBuyInfo = {
@@ -179,12 +193,20 @@ async function startSimulationMode(config, keypair, activeTokens) {
       // Set profit targets (as multipliers)
       position.profitTarget1 = config.profitTarget1;
       position.profitTarget2 = config.profitTarget2;
+      position.profitTarget3 = config.profitTarget3;
+      position.profitTarget4 = config.profitTarget4;
+      position.profitTarget5 = config.profitTarget5;
       
       // Add to active tokens
       activeTokens.push(position);
       
       logger.info(`[SIMULATION] Successfully bought ${tokenInfo.name} for ${simulatedBuyInfo.solAmount} SOL`);
-      logger.info(`[SIMULATION] Token added to monitoring with profit targets: ${position.profitTarget1}x and ${position.profitTarget2}x`);
+      logger.info(`[SIMULATION] Token added to monitoring with multi-tiered profit targets:`);
+      logger.info(`[SIMULATION] - Target 1: ${position.profitTarget1}x (sell ${config.sellPercentage1}%)`);
+      logger.info(`[SIMULATION] - Target 2: ${position.profitTarget2}x (sell ${config.sellPercentage2}%)`);
+      logger.info(`[SIMULATION] - Target 3: ${position.profitTarget3}x (sell ${config.sellPercentage3}%)`);
+      logger.info(`[SIMULATION] - Target 4: ${position.profitTarget4}x (sell ${config.sellPercentage4}%)`);
+      logger.info(`[SIMULATION] - Target 5: ${position.profitTarget5}x (sell ${config.sellPercentage5}%)`);      
       
       // Simulate price evolution for this token
       simulatePriceMovement(position, config);
@@ -455,13 +477,22 @@ async function extractTokenInfoFromTransaction(transaction, signature) {
  * @param {Array} activeTokens - Array to store active token positions
  */
 async function handleNewToken(tokenInfo, config, keypair, activeTokens) {
-  // Apply filtering to check if the token is likely to be safe
+  // Step 1: Apply basic filtering to check if the token name/symbol is likely to be safe
   if (!await isTokenSafe(tokenInfo)) {
-    logger.warn(`Token ${tokenInfo.name} (${tokenInfo.mintAddress}) did not pass safety filters, skipping`);
+    logger.warn(`Token ${tokenInfo.name} (${tokenInfo.mintAddress}) did not pass basic safety filters, skipping`);
     return;
   }
   
-  logger.info(`Token ${tokenInfo.name} (${tokenInfo.mintAddress}) passed safety filters, attempting to buy`);
+  // Step 2: Apply advanced security checks for malicious instructions and mint authorities
+  const connection = getHttpConnection('confirmed');
+  const isSecure = await isTokenSecure(connection, tokenInfo.mintAddress, tokenInfo.transactionSignature);
+  
+  if (!isSecure) {
+    logger.warn(`Token ${tokenInfo.name} (${tokenInfo.mintAddress}) failed security checks, potential scam detected`);
+    return;
+  }
+  
+  logger.info(`Token ${tokenInfo.name} (${tokenInfo.mintAddress}) passed all safety filters, attempting to buy`);
   
   try {
     // Execute buy order via Jupiter
@@ -485,9 +516,19 @@ async function handleNewToken(tokenInfo, config, keypair, activeTokens) {
       buyInfo.tokenAmount
     );
     
-    // Set profit targets
-    position.profitTarget1 = config.profitTarget1 * buyInfo.tokenPrice;
-    position.profitTarget2 = config.profitTarget2 * buyInfo.tokenPrice;
+    // Set multi-tiered profit targets
+    position.profitTarget1 = config.profitTarget1; // 1.3x
+    position.profitTarget2 = config.profitTarget2; // 2.0x
+    position.profitTarget3 = config.profitTarget3; // 3.0x
+    position.profitTarget4 = config.profitTarget4; // 4.0x
+    position.profitTarget5 = config.profitTarget5; // 8.0x
+    
+    logger.info(`Token added to monitoring with multi-tiered profit targets:`);
+    logger.info(`- Target 1: ${position.profitTarget1}x (sell ${config.sellPercentage1}%)`);
+    logger.info(`- Target 2: ${position.profitTarget2}x (sell ${config.sellPercentage2}%)`);
+    logger.info(`- Target 3: ${position.profitTarget3}x (sell ${config.sellPercentage3}%)`);
+    logger.info(`- Target 4: ${position.profitTarget4}x (sell ${config.sellPercentage4}%)`);
+    logger.info(`- Target 5: ${position.profitTarget5}x (sell ${config.sellPercentage5}%)`);
     
     // Add to active tokens
     activeTokens.push(position);
@@ -558,6 +599,7 @@ async function monitorTokenPrices(config, keypair, activeTokens) {
       }
       
       // Check if price targets are hit
+      // First profit target (1.3x) - sell 15%
       if (token.soldPercentage < config.sellPercentage1 && priceRatio >= config.profitTarget1) {
         logger.info(`First profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling ${config.sellPercentage1}%`);
         
@@ -590,22 +632,137 @@ async function monitorTokenPrices(config, keypair, activeTokens) {
         } catch (error) {
           logger.error(`Failed to sell ${token.name} at first target: ${error.message}`);
         }
-      } else if (token.soldPercentage < config.sellPercentage2 && priceRatio >= config.profitTarget2) {
-        logger.info(`Second profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling remaining`);
+      } 
+      // Second profit target (2x) - sell 50%
+      else if (token.soldPercentage < config.sellPercentage2 && priceRatio >= config.profitTarget2) {
+        const targetSellPercentage = config.sellPercentage2;
+        const additionalPercentage = targetSellPercentage - token.soldPercentage;
         
-        // Calculate remaining amount to sell
-        const remainingPercentage = config.sellPercentage2 - token.soldPercentage;
-        const sellAmount = token.tokenAmount * (remainingPercentage / 100);
+        logger.info(`Second profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling additional ${additionalPercentage}%`);
+        
+        // Calculate amount to sell
+        const sellAmount = token.tokenAmount * (additionalPercentage / 100);
         
         try {
           if (config.simulationMode) {
             // Simulate sell without making actual transaction
-            logger.info(`[SIMULATION] Successfully sold remaining ${remainingPercentage}% of ${token.name} at ${priceRatio.toFixed(2)}x profit`);
+            logger.info(`[SIMULATION] Successfully sold additional ${additionalPercentage}% of ${token.name} at ${priceRatio.toFixed(2)}x profit`);
             const solReceived = sellAmount * token.currentPrice;
             logger.info(`[SIMULATION] Received ${solReceived.toFixed(4)} SOL from sale`);
             
             // Update token status
-            token.soldPercentage = config.sellPercentage2;
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          } else {
+            // Execute real sell
+            await trader.sellToken(
+              config.rpcUrl,
+              keypair,
+              token.mintAddress,
+              sellAmount,
+              config.slippageBps
+            );
+            
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          }
+        } catch (error) {
+          logger.error(`Failed to sell ${token.name} at second target: ${error.message}`);
+        }
+      }
+      // Third profit target (3x) - sell 15%
+      else if (token.soldPercentage < config.sellPercentage3 && priceRatio >= config.profitTarget3) {
+        const targetSellPercentage = config.sellPercentage3;
+        const additionalPercentage = targetSellPercentage - token.soldPercentage;
+        
+        logger.info(`Third profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling additional ${additionalPercentage}%`);
+        
+        // Calculate amount to sell
+        const sellAmount = token.tokenAmount * (additionalPercentage / 100);
+        
+        try {
+          if (config.simulationMode) {
+            // Simulate sell without making actual transaction
+            logger.info(`[SIMULATION] Successfully sold additional ${additionalPercentage}% of ${token.name} at ${priceRatio.toFixed(2)}x profit`);
+            const solReceived = sellAmount * token.currentPrice;
+            logger.info(`[SIMULATION] Received ${solReceived.toFixed(4)} SOL from sale`);
+            
+            // Update token status
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          } else {
+            // Execute real sell
+            await trader.sellToken(
+              config.rpcUrl,
+              keypair,
+              token.mintAddress,
+              sellAmount,
+              config.slippageBps
+            );
+            
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          }
+        } catch (error) {
+          logger.error(`Failed to sell ${token.name} at third target: ${error.message}`);
+        }
+      }
+      // Fourth profit target (4x) - sell 15%
+      else if (token.soldPercentage < config.sellPercentage4 && priceRatio >= config.profitTarget4) {
+        const targetSellPercentage = config.sellPercentage4;
+        const additionalPercentage = targetSellPercentage - token.soldPercentage;
+        
+        logger.info(`Fourth profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling additional ${additionalPercentage}%`);
+        
+        // Calculate amount to sell
+        const sellAmount = token.tokenAmount * (additionalPercentage / 100);
+        
+        try {
+          if (config.simulationMode) {
+            // Simulate sell without making actual transaction
+            logger.info(`[SIMULATION] Successfully sold additional ${additionalPercentage}% of ${token.name} at ${priceRatio.toFixed(2)}x profit`);
+            const solReceived = sellAmount * token.currentPrice;
+            logger.info(`[SIMULATION] Received ${solReceived.toFixed(4)} SOL from sale`);
+            
+            // Update token status
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          } else {
+            // Execute real sell
+            await trader.sellToken(
+              config.rpcUrl,
+              keypair,
+              token.mintAddress,
+              sellAmount,
+              config.slippageBps
+            );
+            
+            token.soldPercentage = targetSellPercentage;
+            token.status = `Sold ${token.soldPercentage}%`;
+          }
+        } catch (error) {
+          logger.error(`Failed to sell ${token.name} at fourth target: ${error.message}`);
+        }
+      }
+      // Fifth profit target (8x) - sell final 5%
+      else if (token.soldPercentage < config.sellPercentage5 && priceRatio >= config.profitTarget5) {
+        const targetSellPercentage = config.sellPercentage5;
+        const additionalPercentage = targetSellPercentage - token.soldPercentage;
+        
+        logger.info(`Fifth profit target hit for ${token.name} (${priceRatio.toFixed(2)}x) - selling final ${additionalPercentage}%`);
+        
+        // Calculate amount to sell
+        const sellAmount = token.tokenAmount * (additionalPercentage / 100);
+        
+        try {
+          if (config.simulationMode) {
+            // Simulate sell without making actual transaction
+            logger.info(`[SIMULATION] Successfully sold final ${additionalPercentage}% of ${token.name} at ${priceRatio.toFixed(2)}x profit`);
+            const solReceived = sellAmount * token.currentPrice;
+            logger.info(`[SIMULATION] Received ${solReceived.toFixed(4)} SOL from sale`);
+            
+            // Update token status
+            token.soldPercentage = 100;
             token.status = 'Fully Sold';
           } else {
             // Execute real sell
@@ -617,11 +774,11 @@ async function monitorTokenPrices(config, keypair, activeTokens) {
               config.slippageBps
             );
             
-            token.soldPercentage = config.sellPercentage2;
+            token.soldPercentage = 100;
             token.status = 'Fully Sold';
           }
         } catch (error) {
-          logger.error(`Failed to sell ${token.name} at second target: ${error.message}`);
+          logger.error(`Failed to sell ${token.name} at fifth target: ${error.message}`);
         }
       }
     } catch (error) {

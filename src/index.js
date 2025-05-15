@@ -50,8 +50,13 @@ async function main() {
     logger.info('Configuration:');
     logger.info(` - Buy Amount: ${config.buyAmountSol} SOL`);
     logger.info(` - Slippage: ${config.slippageBps} bps`);
-    logger.info(` - Profit Targets: ${config.profitTarget1}x and ${config.profitTarget2}x`);
-    logger.info(` - Sell Percentages: ${config.sellPercentage1}% and ${config.sellPercentage2}%`);
+    logger.info(` - Profit Targets:`);
+    logger.info(`    Target 1: ${config.profitTarget1}x (sell ${config.sellPercentage1}%)`);
+    logger.info(`    Target 2: ${config.profitTarget2}x (sell ${config.sellPercentage2}%)`);
+    logger.info(`    Target 3: ${config.profitTarget3}x (sell ${config.sellPercentage3}%)`);
+    logger.info(`    Target 4: ${config.profitTarget4}x (sell ${config.sellPercentage4}%)`);
+    logger.info(`    Target 5: ${config.profitTarget5}x (sell ${config.sellPercentage5}%)`);
+    logger.info(` - Exit Strategy: Multi-tiered (${config.sellPercentage1}% + ${config.sellPercentage2}% + ${config.sellPercentage3}% + ${config.sellPercentage4}% + ${config.sellPercentage5}%)`);
     if (config.simulationMode) {
       logger.info(` - Simulation Mode: Enabled`);
     }

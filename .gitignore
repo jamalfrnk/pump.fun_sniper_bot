@@ -1,0 +1,27 @@
+
+# Sensitive files
+.env
+.env.*
+sniper-wallet.json
+*wallet*.json
+bot.log
+
+# Environment
+.replit
+.upm/
+.config/
+.cache/
+
+# Build artifacts
+target/
+debug/
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# API Keys and Secrets
+*.pem
+*.key
