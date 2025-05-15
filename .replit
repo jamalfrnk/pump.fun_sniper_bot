@@ -1,9 +1,27 @@
-modules = ["rust", "rust-1.75.0"]
+modules = ["rust", "rust-1.75.0", "nodejs-20"]
 
 [nix]
 channel = "stable-24_05"
 
 [workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Solana Pump.fun Sniper Bot"
+
+[[workflows.workflow]]
+name = "Solana Pump.fun Sniper Bot"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "node src/index.js"
 
 [deployment]
 run = ["sh", "-c", "cargo run"]
