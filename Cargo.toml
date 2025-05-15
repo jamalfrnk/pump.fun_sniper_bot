@@ -1,0 +1,18 @@
+[package]
+name = "solana-pumpfun-sniper"
+version = "0.1.0"
+edition = "2021"
+description = "Automated trading bot for Solana Pump.fun tokens"
+authors = ["Your Name <your.email@example.com>"]
+
+[dependencies]
+solana-sdk = "1.16"          # Solana SDK for keypairs, pubkeys, system instructions
+solana-client = "1.16"       # Solana RPC client for sending transactions
+tokio = { version = "1", features = ["full"] }  # Async runtime for subscriptions
+anyhow = "1"                 # Error handling
+dotenv = "0.15"              # To load env variables like private keys
+log = "0.4"                  # Logging library
+env_logger = "0.10"          # Logger implementation
+serde = { version = "1", features = ["derive"] }  # Serialization
+serde_json = "1"             # JSON serialization
+bs58 = "0.4"                 # For base58 encoding/decoding used in Solana addresses

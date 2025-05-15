@@ -1,0 +1,9 @@
+modules = ["rust", "rust-1.75.0"]
+
+[nix]
+channel = "stable-24_05"
+
+[workflows]
+
+[deployment]
+run = ["sh", "-c", "cargo run"]

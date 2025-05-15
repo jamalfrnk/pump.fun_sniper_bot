@@ -1,0 +1,11 @@
+[package]
+name = "solana-bot-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-sdk = "1.16"
+solana-client = "1.16"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+dotenv = "0.15"
