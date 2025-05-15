@@ -11,23 +11,39 @@ async function main() {
     // Load configuration
     const config = loadConfig();
     logger.info('Starting Solana Pump.fun Sniper Bot');
+    
+    // Check for simulation/devnet modes
+    if (config.simulationMode) {
+      logger.info('🔬 Starting in SIMULATION MODE - no real transactions will be executed');
+    }
+    if (config.devnetMode) {
+      logger.info('🧪 Using DEVNET instead of mainnet');
+      // Update RPC URL for devnet if needed
+      config.rpcUrl = 'https://api.devnet.solana.com';
+    }
+    
     logger.info(`Using RPC URL: ${config.rpcUrl}`);
     
     // Initialize wallet
     const keypair = getOrCreateKeypair(config);
     logger.info(`Wallet loaded: ${keypair.publicKey.toString()}`);
     
-    // Get wallet balance
-    try {
-      const balance = await getWalletBalance(config.rpcUrl, keypair.publicKey);
-      logger.info(`SOL Balance: ${balance} SOL`);
-      
-      if (balance < config.buyAmountSol) {
-        logger.warn(`Wallet balance (${balance} SOL) is less than buy amount (${config.buyAmountSol} SOL)`);
-        logger.warn('The bot may not be able to execute buy orders with the current settings');
+    // Get wallet balance (skip actual RPC call in simulation mode)
+    if (config.simulationMode) {
+      const simulatedBalance = 2.5; // Simulate having enough SOL
+      logger.info(`[SIMULATION] SOL Balance: ${simulatedBalance} SOL (simulated)`);
+    } else {
+      try {
+        const balance = await getWalletBalance(config.rpcUrl, keypair.publicKey);
+        logger.info(`SOL Balance: ${balance} SOL`);
+        
+        if (balance < config.buyAmountSol) {
+          logger.warn(`Wallet balance (${balance} SOL) is less than buy amount (${config.buyAmountSol} SOL)`);
+          logger.warn('The bot may not be able to execute buy orders with the current settings');
+        }
+      } catch (error) {
+        logger.error(`Failed to get wallet balance: ${error.message}`);
       }
-    } catch (error) {
-      logger.error(`Failed to get wallet balance: ${error.message}`);
     }
     
     // Print configuration summary
@@ -36,6 +52,14 @@ async function main() {
     logger.info(` - Slippage: ${config.slippageBps} bps`);
     logger.info(` - Profit Targets: ${config.profitTarget1}x and ${config.profitTarget2}x`);
     logger.info(` - Sell Percentages: ${config.sellPercentage1}% and ${config.sellPercentage2}%`);
+    if (config.simulationMode) {
+      logger.info(` - Simulation Mode: Enabled`);
+    }
+    if (config.devnetMode) {
+      logger.info(` - Network: Devnet`);
+    } else {
+      logger.info(` - Network: Mainnet`);
+    }
     
     // Array to store active token positions
     const activeTokens = [];

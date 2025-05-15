@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const { SUSPICIOUS_TOKEN_NAMES } = require('../config');
 
 /**
  * Check if a token is likely to be safe (not a scam/rug)
@@ -20,17 +21,35 @@ async function isTokenSafe(tokenInfo) {
   const nameLowercase = tokenInfo.name.toLowerCase();
   const symbolLowercase = tokenInfo.symbol.toLowerCase();
   
-  // Check for scam keywords in name/symbol
-  const scamKeywords = [
-    'scam', 'rug', 'fake', 'honeypot', 'honey pot', 'ponzi', 
-    'presale', 'pre-sale', 'ico', 'guaranteed', '100x', '1000x'
-  ];
+  // Calculate a risk score based on suspicious keywords
+  let riskScore = 0;
+  const highRiskKeywords = ['scam', 'rug', 'fake', 'honeypot', 'ponzi'];
+  const mediumRiskKeywords = ['moon', 'safe', 'gem', '100x', 'guaranteed'];
   
-  for (const keyword of scamKeywords) {
+  // Check for high risk keywords (immediate rejection)
+  for (const keyword of highRiskKeywords) {
     if (nameLowercase.includes(keyword) || symbolLowercase.includes(keyword)) {
-      logger.warn(`Token name/symbol contains suspicious keyword: ${keyword}`);
+      logger.warn(`Token name/symbol contains high-risk keyword: ${keyword}`);
       return false;
     }
+  }
+  
+  // Check for suspicious keywords (adds to risk score)
+  for (const keyword of SUSPICIOUS_TOKEN_NAMES) {
+    if (nameLowercase.includes(keyword) || symbolLowercase.includes(keyword)) {
+      if (mediumRiskKeywords.includes(keyword)) {
+        riskScore += 2; // Medium risk keywords have higher weight
+      } else {
+        riskScore += 1; // Low risk keywords have lower weight
+      }
+      logger.debug(`Token contains suspicious keyword: ${keyword} (risk score: ${riskScore})`);
+    }
+  }
+  
+  // Reject tokens with too many suspicious keywords
+  if (riskScore >= 3) {
+    logger.warn(`Token rejected due to high risk score: ${riskScore}`);
+    return false;
   }
   
   // 2. Symbol length check

@@ -1,0 +1,162 @@
+Here’s how to adapt each of the five strategies into a **JavaScript-native** plan, using `@solana/web3.js` (v1.x) in your Replit environment:
+
+---
+
+## 1. Migrate to WebSocket Subscriptions
+
+**Why?** One subscription replaces hundreds of HTTP polls.
+
+```js
+import { Connection, PublicKey } from '@solana/web3.js';
+
+const WS_ENDPOINTS = [
+  'wss://api.mainnet-beta.solana.com/',
+  // you can add more WebSocket endpoints here
+];
+
+function getWsConnection() {
+  // round‐robin or pick randomly
+  const url = WS_ENDPOINTS[Math.floor(Math.random() * WS_ENDPOINTS.length)];
+  return new Connection(url, 'confirmed');
+}
+
+async function subscribePumpfun(programIdStr) {
+  const connection = getWsConnection();
+  const programId = new PublicKey(programIdStr);
+
+  console.log(`Subscribing to ${programId}…`);
+  connection.onProgramAccountChange(
+    programId,
+    (keyedAccountInfo, ctx) => {
+      console.log('Account change:', keyedAccountInfo.pubkey.toBase58());
+      // handle your new‐token detection here
+    },
+    'confirmed'
+  );
+}
+
+subscribePumpfun('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P')
+  .catch(console.error);
+```
+
+---
+
+## 2. Exponential Backoff & Retry on 429
+
+Wrap every HTTP RPC call you still need (e.g. one‐offs) in a retry helper:
+
+```js
+async function retryRpc(fn, {
+  retries = 5,
+  delayMs = 500,
+  factor = 2
+} = {}) {
+  try {
+    return await fn();
+  } catch (err) {
+    const is429 = err.message.includes('429');
+    if (is429 && retries > 0) {
+      console.warn(`RPC 429 — retrying in ${delayMs}ms…`);
+      await new Promise(r => setTimeout(r, delayMs));
+      return retryRpc(fn, {
+        retries: retries - 1,
+        delayMs: delayMs * factor,
+        factor
+      });
+    }
+    throw err;
+  }
+}
+
+// Usage:
+const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+const accountInfo = await retryRpc(() =>
+  connection.getAccountInfo(myPubkey)
+);
+```
+
+---
+
+## 3. Pool Multiple RPC Endpoints
+
+Rotate through an array of HTTP endpoints so any one doesn’t get hammered:
+
+```js
+const RPC_ENDPOINTS = [
+  'https://api.mainnet-beta.solana.com',
+  'https://solana-api.projectserum.com',
+  // add more here
+];
+let rpcIndex = 0;
+
+function getHttpConnection() {
+  const url = RPC_ENDPOINTS[rpcIndex % RPC_ENDPOINTS.length];
+  rpcIndex++;
+  return new Connection(url, 'confirmed');
+}
+
+// Usage:
+const conn = getHttpConnection();
+const balance = await retryRpc(() => conn.getBalance(walletPubkey));
+```
+
+---
+
+## 4. Batch & Filter Requests
+
+**Batch multiple accounts** instead of one‐by‐one:
+
+```js
+// Suppose you have an array of mints to check
+const mints = [mintA, mintB, mintC].map(s => new PublicKey(s));
+const conn = getHttpConnection();
+
+// Batch fetch
+const accounts = await retryRpc(() =>
+  conn.getMultipleAccountsInfo(mints)
+);
+accounts.forEach((acct, i) => {
+  if (acct) console.log(mints[i].toBase58(), 'data length:', acct.data.length);
+});
+```
+
+**Filter program accounts** on the RPC side:
+
+```js
+const filters = [
+  { dataSize: 165 },                    // only Pump.fun account size
+  { memcmp: { offset: 0, bytes: '...' } } // optional: match a creator or flag
+];
+const config = { filters };
+const conn = getHttpConnection();
+
+const programAccounts = await retryRpc(() =>
+  conn.getProgramAccounts(new PublicKey(PROGRAM_ID), config)
+);
+programAccounts.forEach(({ pubkey, account }) => {
+  console.log('Filtered account:', pubkey.toBase58());
+});
+```
+
+---
+
+## 5. Upgrade Your Rate Limits
+
+If you still exceed free‐tier limits:
+
+1. **Switch** to a paid RPC provider (QuickNode, Alchemy, Triton, etc.)
+2. **Self-host** a Solana validator or archive node and expose your own RPC/WebSocket.
+
+Paid plans typically boost QPS from a few dozen per minute to hundreds per second—eliminating 429s under heavy load.
+
+---
+
+### 🚀 Next Steps
+
+1. **Convert** all existing polling loops to use `onProgramAccountChange` or `onLogs` WebSocket subscriptions.
+2. **Wrap** any one-off RPC calls (`getBalance`, `getAccountInfo`, etc.) in your `retryRpc` helper.
+3. **Instantiate** your HTTP and WS pools at startup and use `getHttpConnection()` / `getWsConnection()` everywhere.
+4. **Batch** account queries and apply filters to minimize data volume.
+5. **Evaluate** your current RPC plan and upgrade if needed.
+
+With WebSockets, backoff, endpoint-pooling, batching, and (if necessary) a paid plan, your JavaScript sniper bot will stop hitting 429s—and stay online, reliably sniping every new pump.fun launch.

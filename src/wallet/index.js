@@ -1,5 +1,4 @@
-const { Keypair } = require('@solana/web3.js');
-const { Connection, PublicKey } = require('@solana/web3.js');
+const { Keypair, Connection, PublicKey } = require('@solana/web3.js');
 const bs58 = require('bs58');
 const fs = require('fs');
 const logger = require('../utils/logger');
@@ -80,14 +79,25 @@ function getKeypairFromBase58(privateKey) {
  */
 async function getWalletBalance(rpcUrl, publicKey) {
   try {
-    const connection = new Connection(rpcUrl);
-    const balance = await connection.getBalance(publicKey);
+    // Import RPC utilities
+    const { getHttpConnection, retryRpc } = require('../utils/rpc');
+    
+    // Get a connection from the pool
+    const connection = getHttpConnection('confirmed');
+    
+    // Use retry mechanism for balance query
+    const balance = await retryRpc(
+      () => connection.getBalance(publicKey),
+      { description: 'get wallet balance', retries: 7 }
+    );
+    
     // Convert lamports to SOL
     const solBalance = balance / 1_000_000_000;
     return solBalance;
   } catch (error) {
     logger.error(`Failed to get wallet balance: ${error.message}`);
-    throw error;
+    // Return 0 instead of throwing to allow the app to continue
+    return 0;
   }
 }
 
@@ -100,12 +110,19 @@ async function getWalletBalance(rpcUrl, publicKey) {
  */
 async function getTokenBalance(rpcUrl, walletPubkey, mintPubkey) {
   try {
-    const connection = new Connection(rpcUrl);
+    // Import RPC utilities if not already imported
+    const { getHttpConnection, retryRpc } = require('../utils/rpc');
     
-    // Get token accounts owned by the wallet
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, {
-      mint: mintPubkey,
-    });
+    // Get a connection from the pool
+    const connection = getHttpConnection('confirmed');
+    
+    // Get token accounts owned by the wallet with retry
+    const tokenAccounts = await retryRpc(
+      () => connection.getParsedTokenAccountsByOwner(walletPubkey, {
+        mint: mintPubkey,
+      }),
+      { description: 'get token accounts', retries: 5 }
+    );
     
     // If no token accounts, return 0
     if (tokenAccounts.value.length === 0) {
@@ -121,9 +138,53 @@ async function getTokenBalance(rpcUrl, walletPubkey, mintPubkey) {
   }
 }
 
+/**
+ * Request an airdrop of SOL from the Solana devnet (for testing only)
+ * @param {string} rpcUrl - Solana RPC URL (must be devnet)
+ * @param {PublicKey} publicKey - Wallet public key
+ * @param {number} amountSol - Amount of SOL to airdrop
+ * @returns {Promise<string>} Transaction signature
+ */
+async function requestDevnetAirdrop(rpcUrl, publicKey, amountSol = 1) {
+  try {
+    // Only allow this on devnet
+    if (!rpcUrl.includes('devnet')) {
+      throw new Error('Airdrops are only available on Solana devnet');
+    }
+    
+    // Import RPC utilities if not already imported
+    const { getHttpConnection, retryRpc } = require('../utils/rpc');
+    
+    // Get a connection from the pool
+    const connection = getHttpConnection('confirmed');
+    const lamports = Math.floor(amountSol * 1_000_000_000);
+    
+    logger.info(`Requesting ${amountSol} SOL airdrop to ${publicKey.toString()}`);
+    
+    // Request airdrop with retry
+    const signature = await retryRpc(
+      () => connection.requestAirdrop(publicKey, lamports),
+      { description: 'request airdrop', retries: 3 }
+    );
+    
+    // Confirm transaction with retry
+    await retryRpc(
+      () => connection.confirmTransaction(signature),
+      { description: 'confirm airdrop transaction', retries: 10 }
+    );
+    
+    logger.info(`Airdrop successful: ${signature}`);
+    return signature;
+  } catch (error) {
+    logger.error(`Airdrop failed: ${error.message}`);
+    throw error;
+  }
+}
+
 module.exports = {
   getOrCreateKeypair,
   getKeypairFromBase58,
   getWalletBalance,
-  getTokenBalance
+  getTokenBalance,
+  requestDevnetAirdrop
 };

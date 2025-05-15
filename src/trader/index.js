@@ -1,7 +1,8 @@
-const { Connection, PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
 const axios = require('axios');
 const logger = require('../utils/logger');
 const { SOL_MINT } = require('../config');
+const { getHttpConnection, retryRpc } = require('../utils/rpc');
 
 /**
  * Buy a token using Jupiter API
@@ -21,7 +22,7 @@ async function buyToken(rpcUrl, keypair, mintAddress, amountSol, slippageBps) {
     // Convert SOL amount to lamports
     const amountLamports = Math.floor(amountSol * 1_000_000_000);
     
-    // 1. Get a swap quote from Jupiter
+    // 1. Get a swap quote from Jupiter with retry
     const quoteUrl = 'https://quote-api.jup.ag/v6/quote';
     const quoteParams = {
       inputMint: SOL_MINT,
@@ -33,7 +34,10 @@ async function buyToken(rpcUrl, keypair, mintAddress, amountSol, slippageBps) {
     };
     
     logger.debug('Requesting Jupiter quote...');
-    const quoteResponse = await axios.get(quoteUrl, { params: quoteParams });
+    const quoteResponse = await retryRpc(
+      async () => axios.get(quoteUrl, { params: quoteParams }),
+      { description: 'Jupiter quote' }
+    );
     
     if (!quoteResponse.data) {
       throw new Error('Failed to get quote from Jupiter');
@@ -45,7 +49,7 @@ async function buyToken(rpcUrl, keypair, mintAddress, amountSol, slippageBps) {
     
     logger.info(`Quote received: ${amountSol} SOL -> ${outputAmount / 1_000_000} tokens, price: ${pricePerToken} SOL per token`);
     
-    // 2. Get swap instructions from Jupiter
+    // 2. Get swap instructions from Jupiter with retry
     const swapUrl = 'https://quote-api.jup.ag/v6/swap';
     const swapParams = {
       quoteResponse: quote,
@@ -55,7 +59,10 @@ async function buyToken(rpcUrl, keypair, mintAddress, amountSol, slippageBps) {
     };
     
     logger.debug('Requesting Jupiter swap instructions...');
-    const swapResponse = await axios.post(swapUrl, swapParams);
+    const swapResponse = await retryRpc(
+      async () => axios.post(swapUrl, swapParams),
+      { description: 'Jupiter swap instructions' }
+    );
     
     if (!swapResponse.data) {
       throw new Error('Failed to get swap instructions from Jupiter');
@@ -63,16 +70,19 @@ async function buyToken(rpcUrl, keypair, mintAddress, amountSol, slippageBps) {
     
     const { swapTransaction } = swapResponse.data;
     
-    // 3. Execute the swap transaction
-    const connection = new Connection(rpcUrl);
+    // 3. Execute the swap transaction with a connection from our pool
+    const connection = getHttpConnection('confirmed');
     
     // Deserialize the transaction
     const txBuffer = Buffer.from(swapTransaction, 'base64');
     const tx = Transaction.from(txBuffer);
     
-    // Sign and send transaction
+    // Sign and send transaction with retry
     logger.debug('Sending buy transaction...');
-    const signature = await sendAndConfirmTransaction(connection, tx, [keypair]);
+    const signature = await retryRpc(
+      async () => sendAndConfirmTransaction(connection, tx, [keypair]),
+      { description: 'buy transaction confirmation' }
+    );
     
     logger.info(`Buy transaction confirmed: ${signature}`);
     
@@ -107,7 +117,7 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
     // Convert token amount to smallest unit (assuming 6 decimals)
     const tokenAmountSmallest = Math.floor(tokenAmount * 1_000_000);
     
-    // 1. Get a swap quote from Jupiter (token -> SOL)
+    // 1. Get a swap quote from Jupiter (token -> SOL) with retry
     const quoteUrl = 'https://quote-api.jup.ag/v6/quote';
     const quoteParams = {
       inputMint: mintAddress,
@@ -119,7 +129,10 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
     };
     
     logger.debug('Requesting Jupiter quote for sell...');
-    const quoteResponse = await axios.get(quoteUrl, { params: quoteParams });
+    const quoteResponse = await retryRpc(
+      async () => axios.get(quoteUrl, { params: quoteParams }),
+      { description: 'Jupiter quote for sell' }
+    );
     
     if (!quoteResponse.data) {
       throw new Error('Failed to get quote from Jupiter for sell');
@@ -130,7 +143,7 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
     
     logger.info(`Sell quote received: ${tokenAmount} tokens -> ${solOutput} SOL`);
     
-    // 2. Get swap instructions from Jupiter
+    // 2. Get swap instructions from Jupiter with retry
     const swapUrl = 'https://quote-api.jup.ag/v6/swap';
     const swapParams = {
       quoteResponse: quote,
@@ -140,7 +153,10 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
     };
     
     logger.debug('Requesting Jupiter swap instructions for sell...');
-    const swapResponse = await axios.post(swapUrl, swapParams);
+    const swapResponse = await retryRpc(
+      async () => axios.post(swapUrl, swapParams),
+      { description: 'Jupiter swap instructions for sell' }
+    );
     
     if (!swapResponse.data) {
       throw new Error('Failed to get swap instructions from Jupiter for sell');
@@ -148,16 +164,19 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
     
     const { swapTransaction } = swapResponse.data;
     
-    // 3. Execute the swap transaction
-    const connection = new Connection(rpcUrl);
+    // 3. Execute the swap transaction with a connection from our pool
+    const connection = getHttpConnection('confirmed');
     
     // Deserialize the transaction
     const txBuffer = Buffer.from(swapTransaction, 'base64');
     const tx = Transaction.from(txBuffer);
     
-    // Sign and send transaction
+    // Sign and send transaction with retry
     logger.debug('Sending sell transaction...');
-    const signature = await sendAndConfirmTransaction(connection, tx, [keypair]);
+    const signature = await retryRpc(
+      async () => sendAndConfirmTransaction(connection, tx, [keypair]),
+      { description: 'sell transaction confirmation' }
+    );
     
     logger.info(`Sell transaction confirmed: ${signature}`);
     
@@ -176,14 +195,21 @@ async function sellToken(rpcUrl, keypair, mintAddress, tokenAmount, slippageBps)
  */
 async function getTokenPrice(rpcUrl, mintAddress) {
   try {
-    // Use Jupiter Price API to get the current price
+    // Use Jupiter Price API to get the current price with retry
     const priceUrl = 'https://price.jup.ag/v4/price';
     const priceParams = {
       ids: [mintAddress],
       vsToken: SOL_MINT
     };
     
-    const priceResponse = await axios.get(priceUrl, { params: priceParams });
+    const priceResponse = await retryRpc(
+      async () => axios.get(priceUrl, { params: priceParams }),
+      { 
+        description: 'Jupiter price API',
+        retries: 7,  // Use more retries for price checks
+        delayMs: 300  // Shorter initial delay for price checks
+      }
+    );
     
     if (!priceResponse.data) {
       throw new Error('Failed to get price from Jupiter');
