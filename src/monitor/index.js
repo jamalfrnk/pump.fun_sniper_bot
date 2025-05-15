@@ -3,7 +3,7 @@ const logger = require('../utils/logger');
 const { PUMPFUN_PROGRAM_ID } = require('../config');
 const { isTokenSafe } = require('../filter');
 const trader = require('../trader');
-const { getHttpConnection, getWsConnection, retryRpc } = require('../utils/rpc');
+const { getHttpConnection, getWsConnection, retryRpc, getConnectionEndpoint } = require('../utils/rpc');
 
 /**
  * Token information extracted from a new token creation
@@ -645,8 +645,8 @@ async function monitorProgramViaHttp(connection, programId, config, keypair, act
   // Keep track of the last slot we've seen
   let lastCheckedSlot = 0;
   
-  // Use a slower polling interval to avoid rate limits
-  const POLL_INTERVAL_MS = 10000; // 10 seconds
+  // Use a much slower polling interval to avoid rate limits with Alchemy
+  const POLL_INTERVAL_MS = process.env.POLLING_INTERVAL_MS ? parseInt(process.env.POLLING_INTERVAL_MS) : 30000; // 30 seconds by default
   
   // Use a cache to prevent duplicate processing
   const processedSignatures = new Set();
@@ -760,14 +760,14 @@ async function monitorProgramViaHttp(connection, programId, config, keypair, act
         continue;
       }
       
-      // Process each signature
-      for (const sigInfo of programTransactions) {
-        // Skip already processed signatures
-        if (processedSignatures.has(sigInfo.signature) || sigInfo.slot <= lastCheckedSlot) {
-          continue;
-        }
-        
-        // Add to processed set
+      // Process signatures in batches to reduce API calls
+      // First filter out already processed signatures
+      const newSignatures = programTransactions
+        .filter(sigInfo => !processedSignatures.has(sigInfo.signature) && sigInfo.slot > lastCheckedSlot)
+        .slice(0, 5); // Process at most 5 at a time to avoid rate limits
+      
+      // Add all new signatures to processed set
+      for (const sigInfo of newSignatures) {
         processedSignatures.add(sigInfo.signature);
         
         // Maintain cache size
@@ -776,13 +776,33 @@ async function monitorProgramViaHttp(connection, programId, config, keypair, act
           processedSignatures.delete(oldest);
         }
         
-        logger.debug(`Checking transaction signature ${sigInfo.signature}`);
+        logger.debug(`Queuing transaction signature ${sigInfo.signature} for processing`);
+      }
+      
+      // Process each batch of signatures with delays between them
+      for (let i = 0; i < newSignatures.length; i++) {
+        const sigInfo = newSignatures[i];
+        
+        // Add a delay between each signature processing
+        if (i > 0) {
+          await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay between signature processing
+        }
+        
+        logger.debug(`Processing transaction signature ${sigInfo.signature}`);
         
         // Get the transaction details
         try {
+          // Create a new connection with versioned transactions support for this specific request
+          const txConnection = new Connection(getConnectionEndpoint(connection), {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
+          });
+          
           const transaction = await retryRpc(
-            () => connection.getTransaction(sigInfo.signature),
-            { description: 'get transaction details', retries: 3 }
+            () => txConnection.getTransaction(sigInfo.signature, {
+              maxSupportedTransactionVersion: 0
+            }),
+            { description: 'get transaction details', retries: 5, connection: txConnection }
           );
           
           if (!transaction) {
